@@ -235,6 +235,7 @@ def agent_loop(messages):
 ```sh
 git clone https://github.com/shareAI-lab/learn-claude-code
 cd learn-claude-code
+conda create --name learn-claude-code python=3.14.4
 pip install -r requirements.txt
 cp .env.example .env   # 编辑 .env 填入你的 ANTHROPIC_API_KEY
 
