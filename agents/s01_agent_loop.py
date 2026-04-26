@@ -80,24 +80,28 @@ def run_bash(command: str) -> str:
 # -- The core pattern: a while loop that calls tools until the model stops --
 def agent_loop(messages: list):
     while True:
+        # 把消息历史、system prompt 和工具定义一起发给模型：
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,
         )
-        # Append assistant turn
+        # 追加 assistant 回复
         messages.append({"role": "assistant", "content": response.content})
-        # If the model didn't call a tool, we're done
+        # 如果模型没有调用工具就直接返回
         if response.stop_reason != "tool_use":
             return
-        # Execute each tool call, collect results
+        # 如果模型调用了工具，就执行
         results = []
         for block in response.content:
             if block.type == "tool_use":
                 print(f"\033[33m$ {block.input['command']}\033[0m")
+                # 处理工具结果
                 output = run_bash(block.input["command"])
                 print(output[:200])
+                # 组装工具结果
                 results.append({"type": "tool_result", "tool_use_id": block.id,
                                 "content": output})
+        # 把工具结果作为新消息写回去，作为用户的消息进入下一轮
         messages.append({"role": "user", "content": results})
 
 
@@ -110,7 +114,9 @@ if __name__ == "__main__":
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
+        # 用户的请求先进入 messages
         history.append({"role": "user", "content": query})
+        # 执行循环
         agent_loop(history)
         response_content = history[-1]["content"]
         if isinstance(response_content, list):
