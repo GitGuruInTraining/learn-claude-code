@@ -1,30 +1,31 @@
 #!/usr/bin/env python3
-# Harness: background execution -- the model thinks while the harness waits.
+# 挂接层：后台执行——挂接层在等，命令在别线程里跑。
 """
-s08_background_tasks.py - Background Tasks
+s08_background_tasks.py - 后台任务
 
-Run commands in background threads. A notification queue is drained
-before each LLM call to deliver results.
+在后台线程里跑命令。每次调 LLM 前清空通知队列，把结果注入对话。
 
-    Main thread                Background thread
+    主线程                    后台线程
     +-----------------+        +-----------------+
-    | agent loop      |        | task executes   |
+    | 智能体循环        |        | 执行任务         |
     | ...             |        | ...             |
-    | [LLM call] <---+------- | enqueue(result) |
-    |  ^drain queue   |        +-----------------+
+    | [调 LLM] <---+-------- | 入队 result      |
+    |  ^ 排空队列   |        +-----------------+
     +-----------------+
 
-    Timeline:
-    Agent ----[spawn A]----[spawn B]----[other work]----
-                 |              |
-                 v              v
-              [A runs]      [B runs]        (parallel)
-                 |              |
-                 +-- notification queue --> [results injected]
+    时间线：
+    Agent ----[起 A]----[起 B]----[做别的事]----
+                 |            |
+                 v            v
+              [A 执行]     [B 执行]   （并行）
+                 |            |
+                 +-- 通知队列 --> [结果注入到下一轮前]
 
-Key insight: "Fire and forget -- the agent doesn't block while the command runs."
+要点：「起了就别傻等——命令跑着时，智能体不必阻塞。」
 """
 
+# 学习重点：`background_run` 立即返回；真正输出在**下一轮**通过 drain 以「假 user」补进历史。
+# ---------------------------------------------------------------------------
 import os
 import subprocess
 import threading
@@ -46,17 +47,18 @@ MODEL = os.environ["MODEL_ID"]
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use background_run for long-running commands."
 
 
-# -- BackgroundManager: threaded execution + notification queue --
+# -- BackgroundManager：线程执行 + 完成通知队列 --
 class BackgroundManager:
     def __init__(self):
-        self.tasks = {}  # task_id -> {status, result, command}
-        self._notification_queue = []  # completed task results
+        self.tasks = {}  # task_id -> {状态, 输出, 命令}
+        self._notification_queue = []  # 已完成任务的结果摘要
         self._lock = threading.Lock()
 
     def run(self, command: str) -> str:
-        """Start a background thread, return task_id immediately."""
+        """启动后台线程，立即返回 task_id。"""
         task_id = str(uuid.uuid4())[:8]
         self.tasks[task_id] = {"status": "running", "result": None, "command": command}
+        # daemon=True：主程序退出时线程不阻退出；长任务要另做生命周期管理
         thread = threading.Thread(
             target=self._execute, args=(task_id, command), daemon=True
         )
@@ -64,7 +66,7 @@ class BackgroundManager:
         return f"Background task {task_id} started: {command[:80]}"
 
     def _execute(self, task_id: str, command: str):
-        """Thread target: run subprocess, capture output, push to queue."""
+        """线程入口：执行子进程、捕获输出、推入通知队列。"""
         try:
             r = subprocess.run(
                 command, shell=True, cwd=WORKDIR,
@@ -89,7 +91,7 @@ class BackgroundManager:
             })
 
     def check(self, task_id: str = None) -> str:
-        """Check status of one task or list all."""
+        """查询指定任务，或不指定则列出全部。"""
         if task_id:
             t = self.tasks.get(task_id)
             if not t:
@@ -101,7 +103,7 @@ class BackgroundManager:
         return "\n".join(lines) if lines else "No background tasks."
 
     def drain_notifications(self) -> list:
-        """Return and clear all pending completion notifications."""
+        """读取并清空所有未消费的完成通知。"""
         with self._lock:
             notifs = list(self._notification_queue)
             self._notification_queue.clear()
@@ -111,7 +113,7 @@ class BackgroundManager:
 BG = BackgroundManager()
 
 
-# -- Tool implementations --
+# -- 工具实现 --
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
@@ -187,7 +189,8 @@ TOOLS = [
 
 def agent_loop(messages: list):
     while True:
-        # Drain background notifications and inject as system message before LLM call
+        # 在**本轮**让模型“看见”上几次后台已结束的任务（如有）；避免模型永远等不到结果
+        # 用 XML 风格标签包一层，方便模型解析；`messages` 非空才注入，防首轮只有系统层
         notifs = BG.drain_notifications()
         if notifs and messages:
             notif_text = "\n".join(

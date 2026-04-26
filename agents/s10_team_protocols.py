@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
-# Harness: protocols -- structured handshakes between models.
+# 挂接层：协议——模型之间结构化的握手机制。
 """
-s10_team_protocols.py - Team Protocols
+s10_team_protocols.py - 团队协议
 
-Shutdown protocol and plan approval protocol, both using the same
-request_id correlation pattern. Builds on s09's team messaging.
+优雅关闭与计划审批，都用同一套 request_id 串起来。在 s09 团队信箱之上扩展。
 
-    Shutdown FSM: pending -> approved | rejected
+    关闭状态机：pending -> approved | rejected
 
-    Lead                              Teammate
+    负责人 (Lead)                      队友 (Teammate)
     +---------------------+          +---------------------+
     | shutdown_request     |          |                     |
-    | {                    | -------> | receives request    |
-    |   request_id: abc    |          | decides: approve?   |
+    | {                    | -------> | 收到请求             |
+    |   request_id: abc    |          | 是否同意？           |
     | }                    |          |                     |
     +---------------------+          +---------------------+
                                              |
@@ -25,28 +24,29 @@ request_id correlation pattern. Builds on s09's team messaging.
     +---------------------+          +---------------------+
             |
             v
-    status -> "shutdown", thread stops
+    状态 -> "shutdown"，线程结束
 
-    Plan approval FSM: pending -> approved | rejected
+    计划审批 FSM：pending -> approved | rejected
 
-    Teammate                          Lead
+    队友                                负责人
     +---------------------+          +---------------------+
     | plan_approval        |          |                     |
-    | submit: {plan:"..."}| -------> | reviews plan text   |
-    +---------------------+          | approve/reject?     |
+    | 提交: {plan:"..."}  | -------> | 审计划文本          |
+    +---------------------+          | 通过/拒绝？         |
                                      +---------------------+
                                              |
     +---------------------+          +-------v-------------+
-    | plan_approval_resp   | <------- | plan_approval       |
-    | {approve: true}      |          | review: {req_id,    |
-    +---------------------+          |   approve: true}     |
-                                     +---------------------+
+    | 审批结果              | <------- | plan_approval 工具  |
+    | {approve: true}    |          | 审核：{req_id, ...} |
+    +---------------------+          +---------------------+
 
-    Trackers: {request_id: {"target|from": name, "status": "pending|..."}}
+    跟踪表：{request_id: {"target|from": 名, "status": "pending|..."}}
 
-Key insight: "Same request_id correlation pattern, two domains."
+要点：「同一 request_id 关联，两块业务。」
 """
 
+# 学习重点：s09 的扩展——用 request_id 把「发请求/回包」成对，关闭与计划都复用这套路。
+# ---------------------------------------------------------------------------
 import json
 import os
 import subprocess
@@ -78,13 +78,13 @@ VALID_MSG_TYPES = {
     "plan_approval_response",
 }
 
-# -- Request trackers: correlate by request_id --
+# -- 请求跟踪表：用 request_id 串起往返；多线程用锁保护 `*_requests` 字典 --
 shutdown_requests = {}
 plan_requests = {}
 _tracker_lock = threading.Lock()
 
 
-# -- MessageBus: JSONL inbox per teammate --
+# -- MessageBus：每人一个 JSONL 收件箱 --
 class MessageBus:
     def __init__(self, inbox_dir: Path):
         self.dir = inbox_dir
@@ -130,7 +130,7 @@ class MessageBus:
 BUS = MessageBus(INBOX_DIR)
 
 
-# -- TeammateManager with shutdown + plan approval --
+# -- TeammateManager：带关闭与计划审批 --
 class TeammateManager:
     def __init__(self, team_dir: Path):
         self.dir = team_dir
@@ -220,7 +220,7 @@ class TeammateManager:
             self._save_config()
 
     def _exec(self, sender: str, tool_name: str, args: dict) -> str:
-        # these base tools are unchanged from s02
+        # 基础工具与 s02 相同
         if tool_name == "bash":
             return _run_bash(args["command"])
         if tool_name == "read_file":
@@ -257,7 +257,7 @@ class TeammateManager:
         return f"Unknown tool: {tool_name}"
 
     def _teammate_tools(self) -> list:
-        # these base tools are unchanged from s02
+        # 基础工具与 s02 相同
         return [
             {"name": "bash", "description": "Run a shell command.",
              "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
@@ -292,7 +292,7 @@ class TeammateManager:
 TEAM = TeammateManager(TEAM_DIR)
 
 
-# -- Base tool implementations (these base tools are unchanged from s02) --
+# -- 基础工具实现（与 s02 一致）--
 def _safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
@@ -347,8 +347,9 @@ def _run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
-# -- Lead-specific protocol handlers --
+# -- 负责人侧协议处理（关闭 / 计划）--
 def handle_shutdown_request(teammate: str) -> str:
+    """生成 `request_id`、写入跟踪表、往该队友 inbox 发 `shutdown_request`（带 extra 里的 id）。"""
     req_id = str(uuid.uuid4())[:8]
     with _tracker_lock:
         shutdown_requests[req_id] = {"target": teammate, "status": "pending"}
@@ -360,6 +361,7 @@ def handle_shutdown_request(teammate: str) -> str:
 
 
 def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> str:
+    """负责人在此「盖章」：按 id 查 plan_requests，写状态，并给提交者发 `plan_approval_response`。"""
     with _tracker_lock:
         req = plan_requests.get(request_id)
     if not req:
@@ -374,11 +376,12 @@ def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> st
 
 
 def _check_shutdown_status(request_id: str) -> str:
+    """供 `shutdown_response` 工具只读查表；队友的回应会更新同 id 的 status。"""
     with _tracker_lock:
         return json.dumps(shutdown_requests.get(request_id, {"error": "not found"}))
 
 
-# -- Lead tool dispatch (12 tools) --
+# -- 负责人侧工具分派（12 个）--
 TOOL_HANDLERS = {
     "bash":              lambda **kw: _run_bash(kw["command"]),
     "read_file":         lambda **kw: _run_read(kw["path"], kw.get("limit")),
@@ -394,7 +397,7 @@ TOOL_HANDLERS = {
     "plan_approval":     lambda **kw: handle_plan_review(kw["request_id"], kw["approve"], kw.get("feedback", "")),
 }
 
-# these base tools are unchanged from s02
+# 基础工具与 s02 相同
 TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
@@ -424,7 +427,9 @@ TOOLS = [
 
 
 def agent_loop(messages: list):
+    """与 s09 相同主流程；多出的工具（shutdown/plan 等）只是往 BUS 发不同类型的消息并维护 request_id 表。"""
     while True:
+        # 先收「队友/系统」给 lead 的信（含 plan_approval_response 等），再调模型
         inbox = BUS.read_inbox("lead")
         if inbox:
             messages.append({

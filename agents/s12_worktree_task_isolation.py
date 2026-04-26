@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-# Harness: directory isolation -- parallel execution lanes that never collide.
+# 挂接层：目录隔离——并行车道互不相撞。
 """
-s12_worktree_task_isolation.py - Worktree + Task Isolation
+s12_worktree_task_isolation.py - Worktree + 任务隔离
 
-Directory-level isolation for parallel task execution.
-Tasks are the control plane and worktrees are the execution plane.
+用目录级隔离并行执行：任务是控制面，worktree 是执行面。
 
     .tasks/task_12.json
       {
         "id": 12,
-        "subject": "Implement auth refactor",
+        "subject": "实现 auth 重构",
         "status": "in_progress",
         "worktree": "auth-refactor"
       }
@@ -27,9 +26,12 @@ Tasks are the control plane and worktrees are the execution plane.
         ]
       }
 
-Key insight: "Isolate by directory, coordinate by task ID."
+要点：「按目录隔离，用任务 ID 协调。」
 """
 
+# 学习重点：`.tasks` 与主仓可能在不同根——任务通常落在 `REPO_ROOT`；`worktree_run` 的 cwd 是旁路仓目录。
+# `EventBus` 只追加写 jsonl 便于用 `worktree_events` 拉时间线。无 git 时 worktree 工具会报错，属预期。
+# ---------------------------------------------------------------------------
 import json
 import os
 import re
@@ -51,7 +53,7 @@ MODEL = os.environ["MODEL_ID"]
 
 
 def detect_repo_root(cwd: Path) -> Path | None:
-    """Return git repo root if cwd is inside a repo, else None."""
+    """若 cwd 在 git 仓库内则返回根路径，否则 None。"""
     try:
         r = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
@@ -68,6 +70,7 @@ def detect_repo_root(cwd: Path) -> Path | None:
         return None
 
 
+# 在子目录里跑本脚本时仍把任务/worktree 元数据挂到**仓库根**，与日常「从项目根开 agent」一致
 REPO_ROOT = detect_repo_root(WORKDIR) or WORKDIR
 
 SYSTEM = (
@@ -79,7 +82,7 @@ SYSTEM = (
 )
 
 
-# -- EventBus: append-only lifecycle events for observability --
+# -- EventBus：只追加写生命周期事件，便于观测 --
 class EventBus:
     def __init__(self, event_log_path: Path):
         self.path = event_log_path
@@ -118,7 +121,7 @@ class EventBus:
         return json.dumps(items, indent=2)
 
 
-# -- TaskManager: persistent task board with optional worktree binding --
+# -- TaskManager：持久化任务看板，可绑定 worktree 名 --
 class TaskManager:
     def __init__(self, tasks_dir: Path):
         self.dir = tasks_dir
@@ -221,7 +224,7 @@ TASKS = TaskManager(REPO_ROOT / ".tasks")
 EVENTS = EventBus(REPO_ROOT / ".worktrees" / "events.jsonl")
 
 
-# -- WorktreeManager: create/list/run/remove git worktrees + lifecycle index --
+# -- WorktreeManager：增删改查 git worktree，并维护 index 生命周期 --
 class WorktreeManager:
     def __init__(self, repo_root: Path, tasks: TaskManager, events: EventBus):
         self.repo_root = repo_root
@@ -282,12 +285,14 @@ class WorktreeManager:
             )
 
     def create(self, name: str, task_id: int = None, base_ref: str = "HEAD") -> str:
+        """`git worktree add -b wt/<name>` 在 `.worktrees/<name>` 建新检出的工作副本；可选绑定 task_id。"""
         self._validate_name(name)
         if self._find(name):
             raise ValueError(f"Worktree '{name}' already exists in index")
         if task_id is not None and not self.tasks.exists(task_id):
             raise ValueError(f"Task {task_id} not found")
 
+        # 物理目录在 repo 下 .worktrees/<name>；与主工作区并行存在
         path = self.dir / name
         branch = f"wt/{name}"
         self.events.emit(
@@ -296,6 +301,7 @@ class WorktreeManager:
             worktree={"name": name, "base_ref": base_ref},
         )
         try:
+            # 新建分支并在 path 检出；失败会 emit failed 并向外抛，供模型在 tool_result 里看到
             self._run_git(["worktree", "add", "-b", branch, str(path), base_ref])
 
             entry = {
@@ -474,7 +480,7 @@ class WorktreeManager:
 WORKTREES = WorktreeManager(REPO_ROOT, TASKS, EVENTS)
 
 
-# -- Base tools (kept minimal, same style as previous sessions) --
+# -- 基础工具（尽量精简，风格同前几节）--
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
@@ -727,6 +733,7 @@ TOOLS = [
 
 
 def agent_loop(messages: list):
+    """与 s02 同形；工具集含 `task_*` 与 `worktree_*`，由模型在对话里组合「建任务 -> 开旁路 -> 在旁路里跑命令」。"""
     while True:
         response = client.messages.create(
             model=MODEL,
@@ -760,6 +767,7 @@ def agent_loop(messages: list):
 
 
 if __name__ == "__main__":
+    # 任务目录在 REPO_ROOT/.tasks，worktree 元数据在 REPO_ROOT/.worktrees
     print(f"Repo root for s12: {REPO_ROOT}")
     if not WORKTREES.git_available:
         print("Note: Not in a git repo. worktree_* tools will return errors.")

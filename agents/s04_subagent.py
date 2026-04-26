@@ -1,28 +1,30 @@
 #!/usr/bin/env python3
-# Harness: context isolation -- protecting the model's clarity of thought.
+# 挂接层：上下文隔离——保护主线程里模型的思路清晰。
 """
-s04_subagent.py - Subagents
+s04_subagent.py - 子智能体
 
-Spawn a child agent with fresh messages=[]. The child works in its own
-context, sharing the filesystem, then returns only a summary to the parent.
+用全新的 messages=[] 派生子智能体。子体在独立上下文里工作，
+与父体共享文件系统，结束时只把摘要返回给父体。
 
-    Parent agent                     Subagent
+    主智能体                         子智能体
     +------------------+             +------------------+
-    | messages=[...]   |             | messages=[]      |  <-- fresh
-    |                  |  dispatch   |                  |
-    | tool: task       | ---------->| while tool_use:  |
-    |   prompt="..."   |            |   call tools     |
-    |   description="" |            |   append results |
-    |                  |  summary   |                  |
-    |   result = "..." | <--------- | return last text |
+    | messages=[...]   |             | messages=[]      |  <-- 全新上下文
+    |                  |  分发       |                  |
+    | 工具: task        | ---------->| 循环：仍为 tool_use 时 |
+    |   prompt="..."   |            |   执行工具         |
+    |   description    |            |   回写结果         |
+    |                  |  只回摘要  |                    |
+    | 最终摘要文本      | <--------- | 子体见最后一则文本  |
     +------------------+             +------------------+
               |
-    Parent context stays clean.
-    Subagent context is discarded.
+    父体上下文保持干净。
+    子体上下文用后即弃。
 
-Key insight: "Process isolation gives context isolation for free."
+要点：「进程级隔离自然带来上下文隔离。」
 """
 
+# 学习重点：父/子**两套** system + 子体 **不** 带 `task` 工具，防递归；子对话用完即弃。
+# ---------------------------------------------------------------------------
 import os
 import subprocess
 from pathlib import Path
@@ -39,11 +41,13 @@ WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
+# 主智能体：教它「有难题可以发 task」
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use the task tool to delegate exploration or subtasks."
+# 子智能体：不告知 task 工具存在，只要求收工时用自然语言总结（进父体的 tool_result）
 SUBAGENT_SYSTEM = f"You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings."
 
 
-# -- Tool implementations shared by parent and child --
+# -- 父子共用的工具实现 --
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
@@ -101,7 +105,7 @@ TOOL_HANDLERS = {
     "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
 }
 
-# Child gets all base tools except task (no recursive spawning)
+# 子体只有基础工具，无 task，避免无限递归派生子体
 CHILD_TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
@@ -114,16 +118,18 @@ CHILD_TOOLS = [
 ]
 
 
-# -- Subagent: fresh context, filtered tools, summary-only return --
+# -- 子智能体：全新上下文、精简工具、仅返回摘要 --
 def run_subagent(prompt: str) -> str:
-    sub_messages = [{"role": "user", "content": prompt}]  # fresh context
-    for _ in range(30):  # safety limit
+    # 子会话与父的 `messages` 完全脱钩；`prompt` 往往来自父的 task 里的「子任务说明」
+    sub_messages = [{"role": "user", "content": prompt}]  # 干净上下文
+    for _ in range(30):  # 安全上限，防止死循环
         response = client.messages.create(
             model=MODEL, system=SUBAGENT_SYSTEM, messages=sub_messages,
             tools=CHILD_TOOLS, max_tokens=8000,
         )
         sub_messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use":
+            # 子体「说完」了：本响应里应有一段总结性文字给父体看
             break
         results = []
         for block in response.content:
@@ -132,11 +138,11 @@ def run_subagent(prompt: str) -> str:
                 output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)[:50000]})
         sub_messages.append({"role": "user", "content": results})
-    # Only the final text returns to the parent -- child context is discarded
+    # 只把**最后一轮**里 assistant 的 text 段拼成字符串；中间多轮子对话不返回给父体
     return "".join(b.text for b in response.content if hasattr(b, "text")) or "(no summary)"
 
 
-# -- Parent tools: base tools + task dispatcher --
+# -- 主智能体工具：基础工具 + task 派生子体 --
 PARENT_TOOLS = CHILD_TOOLS + [
     {"name": "task", "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
      "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}, "description": {"type": "string", "description": "Short description of the task"}}, "required": ["prompt"]}},
@@ -144,7 +150,9 @@ PARENT_TOOLS = CHILD_TOOLS + [
 
 
 def agent_loop(messages: list):
+    """父体循环同 s02；`task` 的 tool_result 很长时相当于把子报告塞回对话。"""
     while True:
+        # 主智能体：可调用 task 或基础工具
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=PARENT_TOOLS, max_tokens=8000,
@@ -156,15 +164,18 @@ def agent_loop(messages: list):
         for block in response.content:
             if block.type == "tool_use":
                 if block.name == "task":
+                    # 派生子智能体，仅把摘要当 tool_result
                     desc = block.input.get("description", "subtask")
                     prompt = block.input.get("prompt", "")
                     print(f"> task ({desc}): {prompt[:80]}")
                     output = run_subagent(prompt)
                 else:
+                    # 同工作区内 bash/读写
                     handler = TOOL_HANDLERS.get(block.name)
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 print(f"  {str(output)[:200]}")
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+        # 子任务结果以 user 角色回灌
         messages.append({"role": "user", "content": results})
 
 

@@ -1,40 +1,42 @@
 #!/usr/bin/env python3
-# Harness: on-demand knowledge -- domain expertise, loaded when the model asks.
+# 挂接层：按需知识——域内经验在模型需要时再加载。
 """
-s05_skill_loading.py - Skills
+s05_skill_loading.py - 技能（Skills）
 
-Two-layer skill injection that avoids bloating the system prompt:
+双层技能注入，避免把 system prompt 撑爆：
 
-    Layer 1 (cheap): skill names in system prompt (~100 tokens/skill)
-    Layer 2 (on demand): full skill body in tool_result
+    第一层（省 token）：在 system 里只列技能名与简介（约 100 token/技能）
+    第二层（按需）：完整技能正文放在 load_skill 的 tool_result 里
 
     skills/
       pdf/
-        SKILL.md          <-- frontmatter (name, description) + body
+        SKILL.md          <-- 前置元数据（name、description）+ 正文
       code-review/
         SKILL.md
 
-    System prompt:
-    +--------------------------------------+
-    | You are a coding agent.              |
-    | Skills available:                    |
-    |   - pdf: Process PDF files...        |  <-- Layer 1: metadata only
-    |   - code-review: Review code...      |
-    +--------------------------------------+
+    System 中可见（示意）：
+    +----------------------------------------+
+    | 你是编程智能体。                        |
+    | 可用技能：                              |
+    |   - pdf: 处理 PDF 相关任务……           |  <-- 第一层：仅元数据
+    |   - code-review: 做代码审阅……         |
+    +----------------------------------------+
 
-    When model calls load_skill("pdf"):
-    +--------------------------------------+
-    | tool_result:                         |
-    | <skill>                              |
-    |   Full PDF processing instructions   |  <-- Layer 2: full body
-    |   Step 1: ...                        |
-    |   Step 2: ...                        |
-    | </skill>                             |
-    +--------------------------------------+
+    当模型调用 load_skill("pdf") 后，工具返回中：
+    +----------------------------------------+
+    | (tool_result 内容)                     |
+    | <skill>                                |
+    |   此处是完整 PDF 处理说明……             |  <-- 第二层：完整正文
+    |   步骤 1: …                            |
+    |   步骤 2: …                            |
+    | </skill>                               |
+    +----------------------------------------+
 
-Key insight: "Don't put everything in the system prompt. Load on demand."
+要点：「不要把所有说明塞进 system，按需再加载。」
 """
 
+# 学习重点：System 里只放「技能目录」；`load_skill` 才把大段文档搬进对话（两阶段、省首屏 token）
+# ---------------------------------------------------------------------------
 import os
 import re
 import subprocess
@@ -55,7 +57,7 @@ MODEL = os.environ["MODEL_ID"]
 SKILLS_DIR = WORKDIR / "skills"
 
 
-# -- SkillLoader: scan skills/<name>/SKILL.md with YAML frontmatter --
+# -- SkillLoader：扫描 skills/<名>/SKILL.md，解析 YAML 前置区 --
 class SkillLoader:
     def __init__(self, skills_dir: Path):
         self.skills_dir = skills_dir
@@ -63,6 +65,7 @@ class SkillLoader:
         self._load_all()
 
     def _load_all(self):
+        """启动时**一次性**读盘；无 skills 目录则 skills 空表，不报错，便于克隆仓库后逐步加技能。"""
         if not self.skills_dir.exists():
             return
         for f in sorted(self.skills_dir.rglob("SKILL.md")):
@@ -72,7 +75,7 @@ class SkillLoader:
             self.skills[name] = {"meta": meta, "body": body, "path": str(f)}
 
     def _parse_frontmatter(self, text: str) -> tuple:
-        """Parse YAML frontmatter between --- delimiters."""
+        """解析 --- 之间的 YAML 前置区与正文。"""
         match = re.match(r"^---\n(.*?)\n---\n(.*)", text, re.DOTALL)
         if not match:
             return {}, text
@@ -83,7 +86,7 @@ class SkillLoader:
         return meta, match.group(2).strip()
 
     def get_descriptions(self) -> str:
-        """Layer 1: short descriptions for the system prompt."""
+        """第一层：供写入 system 的短描述列表。"""
         if not self.skills:
             return "(no skills available)"
         lines = []
@@ -97,7 +100,7 @@ class SkillLoader:
         return "\n".join(lines)
 
     def get_content(self, name: str) -> str:
-        """Layer 2: full skill body returned in tool_result."""
+        """第二层：完整技能正文，作为 tool_result 返回给模型。"""
         skill = self.skills.get(name)
         if not skill:
             return f"Error: Unknown skill '{name}'. Available: {', '.join(self.skills.keys())}"
@@ -106,7 +109,7 @@ class SkillLoader:
 
 SKILL_LOADER = SkillLoader(SKILLS_DIR)
 
-# Layer 1: skill metadata injected into system prompt
+# 第一层：这里把「技能名 + 短描述」拼进 system；模型想深入细节必须再发 `load_skill` 工具
 SYSTEM = f"""You are a coding agent at {WORKDIR}.
 Use load_skill to access specialized knowledge before tackling unfamiliar topics.
 
@@ -114,7 +117,7 @@ Skills available:
 {SKILL_LOADER.get_descriptions()}"""
 
 
-# -- Tool implementations --
+# -- 工具实现 --
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
@@ -168,6 +171,7 @@ TOOL_HANDLERS = {
     "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    # 返回整段 <skill>…</skill> 字符串，作为一次 tool_result，占用本轮上下文
     "load_skill": lambda **kw: SKILL_LOADER.get_content(kw["name"]),
 }
 
@@ -186,7 +190,9 @@ TOOLS = [
 
 
 def agent_loop(messages: list):
+    """与 s02 相同；仅多 `load_skill` 分派与上面 SYSTEM 的拼接方式。"""
     while True:
+        # system 中已列出技能名；需详情时由 load_skill 在 tool_result 中展开正文
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,

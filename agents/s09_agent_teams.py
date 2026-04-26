@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-# Harness: team mailboxes -- multiple models, coordinated through files.
+# 挂接层：团队信箱——多模型通过文件协调。
 """
-s09_agent_teams.py - Agent Teams
+s09_agent_teams.py - 智能体团队
 
-Persistent named agents with file-based JSONL inboxes. Each teammate runs
-its own agent loop in a separate thread. Communication via append-only inboxes.
+具名的持久化智能体，各自用 JSONL 收件箱。每个成员在独立线程里跑自己的循环，
+靠追加写 inbox 通信。
 
-    Subagent (s04):  spawn -> execute -> return summary -> destroyed
-    Teammate (s09):  spawn -> work -> idle -> work -> ... -> shutdown
+    子智能体 (s04)：派生 -> 执行 -> 返回摘要 -> 销毁
+    队友     (s09)：派生 -> 工作 -> 闲时 -> 再工作 -> … -> 关闭
 
     .team/config.json                   .team/inbox/
     +----------------------------+      +------------------+
@@ -17,32 +17,34 @@ its own agent loop in a separate thread. Communication via append-only inboxes.
     |     "role":"coder",        |      +------------------+
     |     "status":"idle"}       |
     |  ]}                        |      send_message("alice", "fix bug"):
-    +----------------------------+        open("alice.jsonl", "a").write(msg)
+    +----------------------------+        追加写 alice.jsonl
 
-                                        read_inbox("alice"):
-    spawn_teammate("alice","coder",...)   msgs = [json.loads(l) for l in ...]
-         |                                open("alice.jsonl", "w").close()
-         v                                return msgs  # drain
-    Thread: alice             Thread: bob
+                                        read_inbox("alice")：
+    spawn_teammate("alice","coder",...)   读行 -> json.loads
+         |                                清空文件（即 drain）
+         v
+    线程 alice                 线程 bob
     +------------------+      +------------------+
     | agent_loop       |      | agent_loop       |
     | status: working  |      | status: idle     |
-    | ... runs tools   |      | ... waits ...    |
+    | ... 调工具        |      | ... 等待        |
     | status -> idle   |      |                  |
     +------------------+      +------------------+
 
-    5 message types (all declared, not all handled here):
+    5 种消息类型（本文件未必全部处理）：
     +-------------------------+-----------------------------------+
-    | message                 | Normal text message               |
-    | broadcast               | Sent to all teammates             |
-    | shutdown_request        | Request graceful shutdown (s10)   |
-    | shutdown_response       | Approve/reject shutdown (s10)     |
-    | plan_approval_response  | Approve/reject plan (s10)         |
+    | message                 | 普通文本                          |
+    | broadcast               | 发给全体队友                      |
+    | shutdown_request        | 请求优雅关闭 (s10)                |
+    | shutdown_response       | 同意/拒绝关闭 (s10)               |
+    | plan_approval_response  | 同意/拒绝计划 (s10)               |
     +-------------------------+-----------------------------------+
 
-Key insight: "Teammates that can talk to each other."
+要点：「能互相发消息的队友。」
 """
 
+# 学习重点：多线程各自跑 `client.messages`；**文件**是信箱；`read_inbox` 即「收信并清空」。
+# ---------------------------------------------------------------------------
 import json
 import os
 import subprocess
@@ -74,7 +76,7 @@ VALID_MSG_TYPES = {
 }
 
 
-# -- MessageBus: JSONL inbox per teammate --
+# -- MessageBus：每人一个 JSONL 收件箱 --
 class MessageBus:
     def __init__(self, inbox_dir: Path):
         self.dir = inbox_dir
@@ -98,6 +100,7 @@ class MessageBus:
         return f"Sent {msg_type} to {to}"
 
     def read_inbox(self, name: str) -> list:
+        """读出 `name.jsonl` 中所有行后**清空**文件 = 收信后邮箱归零；同一条不重复读。"""
         inbox_path = self.dir / f"{name}.jsonl"
         if not inbox_path.exists():
             return []
@@ -120,7 +123,7 @@ class MessageBus:
 BUS = MessageBus(INBOX_DIR)
 
 
-# -- TeammateManager: persistent named agents with config.json --
+# -- TeammateManager：具名成员 + config.json 持久化 --
 class TeammateManager:
     def __init__(self, team_dir: Path):
         self.dir = team_dir
@@ -204,7 +207,7 @@ class TeammateManager:
             self._save_config()
 
     def _exec(self, sender: str, tool_name: str, args: dict) -> str:
-        # these base tools are unchanged from s02
+        # 基础工具与 s02 相同
         if tool_name == "bash":
             return _run_bash(args["command"])
         if tool_name == "read_file":
@@ -220,7 +223,7 @@ class TeammateManager:
         return f"Unknown tool: {tool_name}"
 
     def _teammate_tools(self) -> list:
-        # these base tools are unchanged from s02
+        # 基础工具与 s02 相同
         return [
             {"name": "bash", "description": "Run a shell command.",
              "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
@@ -251,7 +254,7 @@ class TeammateManager:
 TEAM = TeammateManager(TEAM_DIR)
 
 
-# -- Base tool implementations (these base tools are unchanged from s02) --
+# -- 基础工具实现（与 s02 一致）--
 def _safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
@@ -306,7 +309,7 @@ def _run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
-# -- Lead tool dispatch (9 tools) --
+# -- 负责人（lead）侧工具分派（9 个）--
 TOOL_HANDLERS = {
     "bash":            lambda **kw: _run_bash(kw["command"]),
     "read_file":       lambda **kw: _run_read(kw["path"], kw.get("limit")),
@@ -319,7 +322,7 @@ TOOL_HANDLERS = {
     "broadcast":       lambda **kw: BUS.broadcast("lead", kw["content"], TEAM.member_names()),
 }
 
-# these base tools are unchanged from s02
+# 基础工具与 s02 相同
 TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
@@ -343,7 +346,9 @@ TOOLS = [
 
 
 def agent_loop(messages: list):
+    """负责人在**每轮**先收 lead 邮箱；有信则当作「用户新消息」进模型（不经过终端 input）。"""
     while True:
+        # 与队友发给自己的 JSON 消息；队友线程里会 send_message 到 "lead"
         inbox = BUS.read_inbox("lead")
         if inbox:
             messages.append({

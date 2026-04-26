@@ -1,32 +1,33 @@
 #!/usr/bin/env python3
-# Harness: planning -- keeping the model on course without scripting the route.
+# 挂接层：规划——把模型拉回正轨，而不用脚本硬编码路线。
 """
 s03_todo_write.py - TodoWrite
 
-The model tracks its own progress via a TodoManager. A nag reminder
-forces it to keep updating when it forgets.
+模型通过 TodoManager 自行跟踪进度；若忘记更新待办，
+挂接层会注入「唠叨」提醒，促使其继续维护列表。
 
-    +----------+      +-------+      +---------+
-    |   User   | ---> |  LLM  | ---> | Tools   |
-    |  prompt  |      |       |      | + todo  |
-    +----------+      +---+---+      +----+----+
-                          ^               |
-                          |   tool_result |
-                          +---------------+
+    +----------+      +---------+      +----------------+
+    |  用户    | ---> |  模型   | ---> | 工具(含 todo)  |
+    |  输入    |      |  (LLM)  |      +----------------+
+    +----------+      +---------+            ^
+                          |                  | tool_result
+                          +------------------+
                                 |
-                    +-----------+-----------+
-                    | TodoManager state     |
-                    | [ ] task A            |
-                    | [>] task B <- doing   |
-                    | [x] task C            |
-                    +-----------------------+
+                    +-----------+------------+
+                    | TodoManager 中的列表   |
+                    | [ ] 任务甲              |
+                    | [>] 任务乙 <- 当前进行   |
+                    | [x] 任务丙              |
+                    +------------------------+
                                 |
-                    if rounds_since_todo >= 3:
-                      inject <reminder>
+            若自上次用 todo 起已满 3 个工具轮次：
+            在结果侧额外注入 <reminder> 唠叨
 
-Key insight: "The agent can track its own progress -- and I can see it."
+要点：「智能体自己能跟进度——我还能在界面上看见。」
 """
 
+# 学习重点：① 仍用工具表示「计划」② 用 `rounds_since_todo` + 注入 text 提醒防「忘更新待办」
+# ---------------------------------------------------------------------------
 import os
 import subprocess
 from pathlib import Path
@@ -48,12 +49,14 @@ Use the todo tool to plan multi-step tasks. Mark in_progress before starting, co
 Prefer tools over prose."""
 
 
-# -- TodoManager: structured state the LLM writes to --
+# -- TodoManager：由 LLM 读写的结构化状态 --
+# 状态只存在进程内存；与 s07 的磁盘任务板不同，这里适合「当前会话内的短列表」
 class TodoManager:
     def __init__(self):
         self.items = []
 
     def update(self, items: list) -> str:
+        """模型通过 todo 工具提交**整表**替换；这里做校验并重新 render 成可读串给 tool_result。"""
         if len(items) > 20:
             raise ValueError("Max 20 todos allowed")
         validated = []
@@ -89,7 +92,7 @@ class TodoManager:
 TODO = TodoManager()
 
 
-# -- Tool implementations --
+# -- 工具实现 --
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
@@ -160,11 +163,12 @@ TOOLS = [
 ]
 
 
-# -- Agent loop with nag reminder injection --
+# -- 带「唠叨」提醒注入的智能体循环 --
 def agent_loop(messages: list):
+    # 统计「自上次用 todo 之后，累计走了几轮有工具产出的轮次」
     rounds_since_todo = 0
     while True:
-        # Nag reminder is injected below, alongside tool results
+        # 调模型；若多轮未用 todo，稍后在同一条 user 里追加唠叨（见本循环末尾）
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,
@@ -186,7 +190,9 @@ def agent_loop(messages: list):
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
                 if block.name == "todo":
                     used_todo = True
+        # 本轮如果调用过 todo，计数器清零；否则 +1
         rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
+        # 与 tool_result 并列塞一段 **纯文本** 块（type:text），对模型等效于用户侧多了一句提醒
         if rounds_since_todo >= 3:
             results.append({"type": "text", "text": "<reminder>Update your todos.</reminder>"})
         messages.append({"role": "user", "content": results})

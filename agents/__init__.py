@@ -1,3 +1,10 @@
-# agents/ - Harness implementations (s01-s12) + full reference (s_full)
-# Each file is self-contained and runnable: python agents/s01_agent_loop.py
-# The model is the agent. These files are the harness.
+# agents/ - 教学用「Harness」实现集合
+#
+# 本包内的 s01–s12 与 s_full 均为**可独立运行的参考脚本**：
+#   python agents/s01_agent_loop.py
+#
+# 概念说明：
+# - **模型（LLM）** 是「智能体」；这些 .py 文件是**挂接层（harness）**：
+#   负责发请求、解析 tool_use、执行工具、把结果写回对话，形成循环。
+# - 各文件按主题递进：工具扩展、待办、子智能体、技能按需加载、上下文压缩、
+#   持久化任务、后台执行、团队信箱、协议、自主轮询、worktree 隔离等。
