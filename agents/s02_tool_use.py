@@ -93,6 +93,7 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
 
 
 # -- 分发表：模型在 tool_use 里给的是 `name` 与 `input`；用 name 找 Python 函数并 **展开 input 当 kwargs**
+# dispatch map 将工具名映射到处理函数
 # 这样新增工具 = 在 TOOLS 里声明 + 在 HANDLERS 里挂一行，agent_loop 不用改
 TOOL_HANDLERS = {
     "bash":       lambda **kw: run_bash(kw["command"]),
@@ -101,6 +102,10 @@ TOOL_HANDLERS = {
     "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
 }
 
+# 工具
+# name：工具名称，description：工具描述
+# 不同于s01，增加了处理函数。路径沙箱防止逃逸工作区。
+# input_schema：规范了怎么传参，和强制约束与验证
 TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
